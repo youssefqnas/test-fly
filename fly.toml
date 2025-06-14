@@ -3,25 +3,30 @@ primary_region = 'cdg'
 
 [build]
 
-[http_service]
+[[services]]
   internal_port = 8080
-  force_https = true
-  auto_stop_machines = false  # ✅ ما تقفلش التطبيق تلقائي
-  auto_start_machines = true
-  min_machines_running = 1    # ✅ خلي دايمًا فيه instance شغالة
+  protocol = "tcp"
   processes = ['app']
+
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+
+  [services.concurrency]
+    type = "connections"
+    hard_limit = 25
+    soft_limit = 20
 
 [[vm]]
   memory = '1gb'
   cpu_kind = 'shared'
   cpus = 1
   memory_mb = 1024
-
-[checks]
-  [checks.healthcheck]
-    type = "http"
-    interval = "15s"
-    timeout = "2s"
-    method = "get"
-    path = "/health"
-    port = 8080
