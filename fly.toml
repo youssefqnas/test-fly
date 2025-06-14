@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for test-fly-a2kung on 2025-06-13T23:47:13Z
+# fly.toml app configuration file generated for test-fly-a97rtq on 2025-06-14T10:03:24Z
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'test-fly-a2kung'
+app = 'test-fly-a97rtq'
 primary_region = 'cdg'
 
 [build]
