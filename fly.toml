@@ -1,29 +1,20 @@
-app = 'test-fly-a2kung'
-primary_region = 'cdg'
+# fly.toml app configuration file generated for test-fly-p41c5w on 2025-06-14T13:07:58Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
+
+app = 'test-fly-p41c5w'
+primary_region = 'lhr'
 
 [build]
 
-[[services]]
+[http_service]
   internal_port = 8080
-  protocol = "tcp"
-  processes = ['app']
-
-  auto_stop_machines = false
+  force_https = true
+  auto_stop_machines = 'stop'
   auto_start_machines = true
-  min_machines_running = 1
-
-  [[services.ports]]
-    handlers = ["http"]
-    port = 80
-
-  [[services.ports]]
-    handlers = ["tls", "http"]
-    port = 443
-
-  [services.concurrency]
-    type = "connections"
-    hard_limit = 25
-    soft_limit = 20
+  min_machines_running = 0
+  processes = ['app']
 
 [[vm]]
   memory = '1gb'
