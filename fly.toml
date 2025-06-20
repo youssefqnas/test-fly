@@ -1,4 +1,4 @@
-app = "test-wdhab1"
+app = "test-wdhab2"
 primary_region = "lhr"
 
 [http_service]
