@@ -1,119 +1,146 @@
 import asyncio
-import websockets
+import functools
 import json
+import logging
 import os
-from datetime import datetime
-import clickhouse_connect
+from datetime import datetime, timezone
 
-# --- بيانات الاتصال بـ ClickHouse Cloud ---
+import aiohttp
+from clickhouse_driver import Client
+from dotenv import load_dotenv
+
+# ======================= الإعدادات ========================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+load_dotenv()
+
 CLICKHOUSE_HOST = "b2ldg6nk61.europe-west4.gcp.clickhouse.cloud"
 CLICKHOUSE_USER = "default"
-# <<<--- ضع هنا كلمة المرور الجديدة والسرية
-CLICKHOUSE_PASSWORD = "8SLA3MyJ_12r0" 
+CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_DB_PASSWORD", "8SLA3MyJ_12r0")
 
+SYMBOL = 'btcusdt'
+BATCH_SIZE = 200
+MAX_WAIT_SECONDS = 5
 
-# 🆕 تحديد الحد الأقصى لعدد الاتصالات المتزامنة
-MAX_CONCURRENT_CONNECTIONS = 10 # يمكنك تعديل هذا الرقم، ابدأ بـ 5-10 وجرب
-
+# ================== متغيرات تخزين ==================
+trade_batch = []
 client = None
-try:
-    client = clickhouse_connect.get_client(
-        host=CLICKHOUSE_HOST,
-        port=8443,
-        user=CLICKHOUSE_USER,
-        password=CLICKHOUSE_PASSWORD,
-        secure=True,
-        settings={'max_threads': os.cpu_count() or 4} 
+flush_lock = asyncio.Lock()
+
+last_printed_trade_price = 0.0
+
+# ================== ClickHouse ==================
+def connect_clickhouse():
+    global client
+    client = Client(
+        host=CLICKHOUSE_HOST, user=CLICKHOUSE_USER, password=CLICKHOUSE_PASSWORD,
+        secure=True, port=9440
     )
-    print("✅ تم الاتصال بنجاح بـ ClickHouse Cloud.")
-except Exception as e:
-    print(f"❌ فشل الاتصال بـ ClickHouse: {e}")
-    exit()
+    client.execute('SELECT 1')
+    client.execute("""
+    CREATE TABLE IF NOT EXISTS market_realtime (
+        symbol LowCardinality(String),
+        timestamp DateTime64(3, 'UTC'),
+        price Float64,
+        qty Float64,
+        best_bid Float64,
+        best_ask Float64
+    ) ENGINE = MergeTree() PARTITION BY toYYYYMM(timestamp) ORDER BY (symbol, timestamp)
+    """)
+    logging.info("✅ تم الاتصال وإنشاء جدول market_realtime.")
 
-def get_all_available_symbols():
-    query = "SELECT symbol FROM symbols WHERE used = 0"
-    result = client.query(query)
-    if result.result_rows:
-        return [row[0] for row in result.result_rows]
-    return []
-
-def mark_symbols_used(symbols: list[str]):
-    if not symbols:
-        return True 
+# ================== إدخال البيانات ==================
+def _blocking_insert_trades(batch):
     try:
-        data_to_insert = [[symbol, 1] for symbol in symbols]
-        client.insert("symbols", data_to_insert, column_names=['symbol', 'used'])
-        print(f"✅ تم تحديث حالة {len(symbols)} رمز إلى 'مستخدم'.")
-        return True
+        client.execute('INSERT INTO market_realtime (symbol, timestamp, price, qty, best_bid, best_ask) VALUES', batch)
+        logging.info(f"📥 TRADE: تم إدخال {len(batch)} سجل في قاعدة البيانات.")
     except Exception as e:
-        print(f"❌ حدث خطأ أثناء تحديث الرموز: {e}")
-        return False
+        logging.error(f"❌ خطأ إدخال TRADE: {e}")
 
-# 🆕 تعريف Semaphore كمتغير عام أو تمريره للدالة
-connection_semaphore = asyncio.Semaphore(MAX_CONCURRENT_CONNECTIONS)
+async def flush():
+    global trade_batch
+    if not client: return
 
-async def listen_trades(symbol: str):
-    """
-    (محسّن) يتصل بـ WebSocket، ويقوم بإعادة الاتصال تلقائيًا عند الفشل.
-    """
-    url = f"wss://stream.binance.com:9443/ws/{symbol.lower()}@trade"
-    
+    async with flush_lock:
+        loop = asyncio.get_running_loop()
+        if trade_batch:
+            temp = trade_batch[:]
+            trade_batch.clear()
+            await loop.run_in_executor(None, functools.partial(_blocking_insert_trades, temp))
+
+async def batch_writer():
     while True:
-        # 🆕 هنا يتم الانتظار للحصول على "تصريح" للاتصال
-        async with connection_semaphore: # سيسمح هذا بـ MAX_CONCURRENT_CONNECTIONS فقط في نفس الوقت
-            try:
-                async with websockets.connect(url, open_timeout=10) as ws: # 🆕 يمكن زيادة open_timeout
-                    print(f"🔗 متصل على {symbol} trade stream... بدأ تخزين البيانات فورا.")
-                    
-                    while True:
-                        message = await ws.recv()
-                        data = json.loads(message)
+        await asyncio.sleep(MAX_WAIT_SECONDS)
+        await flush()
 
-                        trade_data = {
-                            'symbol': data['s'],
-                            'trade_time': datetime.fromtimestamp(data['T'] / 1000.0),
-                            'trade_id': data['t'],
-                            'price': float(data['p']),
-                            'quantity': float(data['q']),
-                        }
-                        
-                        try:
-                            client.insert('trades', [list(trade_data.values())], column_names=list(trade_data.keys()))
-                            # طباعة أقل تكراراً لتجنب إغراق الكونسول بالرسائل
-                            # print(f"💾 [{symbol}] تم إدراج صف واحد في جدول trades.")
-                        except Exception as insert_e:
-                            print(f"❌ [{symbol}] حدث خطأ أثناء إدراج صف: {insert_e}")
-            
-            except (websockets.exceptions.ConnectionClosed, ConnectionRefusedError, asyncio.TimeoutError) as e: # 🆕 إضافة asyncio.TimeoutError
-                print(f"🔌 [{symbol}] انقطع الاتصال أو فشل: {e}. إعادة المحاولة بعد 5 ثوانٍ...")
-            except Exception as e:
-                print(f"🔥 [{symbol}] حدث خطأ غير متوقع: {e}. إعادة المحاولة بعد 5 ثوانٍ...")
-        
-        await asyncio.sleep(5) # انتظار قبل إعادة محاولة الاتصال
+# ================== التعامل مع الصفقات ==================
+async def safe_append_trade(trade):
+    async with flush_lock:
+        trade_batch.append(trade)
 
+def handle_trade(data):
+    global last_printed_trade_price
+
+    trade_for_db = {
+        'symbol': data['s'],
+        'timestamp': datetime.fromtimestamp(data['T'] / 1000, tz=timezone.utc),
+        'price': float(data['p']),
+        'qty': float(data['q']),
+        'best_bid': 0.0,  # غير متوفر حالياً
+        'best_ask': 0.0,  # غير متوفر حالياً
+    }
+
+    # ✅ نسجل الصفقة دايمًا
+    asyncio.create_task(safe_append_trade(trade_for_db))
+
+    # ✅ نطبع فقط لو السعر تغير
+    current_price = trade_for_db['price']
+    if current_price != last_printed_trade_price:
+        trade_time_str = trade_for_db['timestamp'].strftime('%H:%M:%S.%f')[:-3]
+        side = "🔼 شراء" if data['m'] else "🔽 بيع"
+        print(f"📈 تغير السعر: {side} | السعر الجديد: {current_price:.2f} | الكمية: {trade_for_db['qty']:.5f} | الوقت: {trade_time_str}")
+        last_printed_trade_price = current_price
+
+# ================== WebSocket ==================
+async def binance_ws():
+    stream = f"{SYMBOL.lower()}@trade"
+    url = f"wss://stream.binance.com:9443/ws/{stream}"
+    logging.info(f"🔌 الاتصال بـ Binance WebSocket: {url}")
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url) as ws:
+                    logging.info("✅ تم الاتصال بنجاح. في انتظار الصفقات...")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            handle_trade(data)
+                            if len(trade_batch) >= BATCH_SIZE:
+                                await flush()
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            logging.warning("🔁 الاتصال انقطع. إعادة المحاولة...")
+                            break
+        except Exception as e:
+            logging.error(f"💥 خطأ في WebSocket: {e}")
+            logging.info("⏳ الانتظار 5 ثواني...")
+            await asyncio.sleep(5)
+
+# ================== التشغيل ==================
 async def main():
-    symbols_to_process = get_all_available_symbols()
-    
-    if not symbols_to_process:
-        print("🟡 لا يوجد أي رمز غير مستخدم حاليا.")
+    try:
+        connect_clickhouse()
+    except Exception as e:
+        logging.fatal(f"❌ فشل الاتصال بـ ClickHouse: {e}")
         return
 
-    print(f"▶️ سيتم تشغيل المراقبة للرموز التالية: {symbols_to_process}")
-
-    if mark_symbols_used(symbols_to_process):
-        tasks = [listen_trades(symbol) for symbol in symbols_to_process]
-        
-        print(f"🚀 إطلاق {len(tasks)} مستمع... (اضغط Ctrl+C للإيقاف)")
-        await asyncio.gather(*tasks)
-    else:
-        print(f"🛑 فشل في حجز الرموز. سيتم إنهاء البرنامج.")
+    writer_task = asyncio.create_task(batch_writer())
+    ws_task = asyncio.create_task(binance_ws())
+    await asyncio.gather(writer_task, ws_task)
 
 if __name__ == "__main__":
+    if CLICKHOUSE_PASSWORD == "8SLA3MyJ_12r0":
+        logging.warning("⚠️ من الأفضل تخزين كلمة المرور في ملف .env")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nتم إيقاف البرنامج.")
-    finally:
-        if client:
-            client.close()
-            print("🔌 تم إغلاق الاتصال بـ ClickHouse.")
+        logging.info("\n🛑 تم إيقاف البرنامج.")
